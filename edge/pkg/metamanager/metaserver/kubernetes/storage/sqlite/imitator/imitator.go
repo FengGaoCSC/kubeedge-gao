@@ -278,6 +278,39 @@ func (s *imitator) Event(msg *model.Message) []watch.Event {
 	return ret
 }
 
+func (s *imitator) PruneByPrefix(ctx context.Context, prefix string, keep map[string]struct{},
+	maxRV uint64, match func(*unstructured.Unstructured) bool) (int, error) {
+	resp, err := s.List(ctx, prefix) // same prefix query GetList uses
+	if err != nil || resp.Kvs == nil {
+		return 0, err
+	}
+	pruned := 0
+	for _, kv := range *resp.Kvs {
+		if _, ok := keep[kv.Key]; ok {
+			continue
+		}
+		var obj unstructured.Unstructured
+		if err := runtime.DecodeInto(s.codec, []byte(kv.Value), &obj); err != nil {
+			continue
+		}
+		// Rows newer than the list snapshot came from a watch event; leave them alone.
+		if rv, err := s.versioner.ObjectResourceVersion(&obj); err == nil && rv > maxRV {
+			continue
+		}
+		if match != nil && !match(&obj) {
+			continue
+		}
+		if err := s.Delete(ctx, kv.Key); err != nil {
+			klog.Errorf("failed to prune %s: %v", kv.Key, err)
+			continue
+		}
+		// Tell local watchers, as Inject does for a real delete.
+		watchhook.Trigger(watch.Event{Type: watch.Deleted, Object: &obj})
+		pruned++
+	}
+	return pruned, nil
+}
+
 // Resource format: <namespace>/<restype>[/resid]
 // return <reskey, restype, resid>
 func parseResource(resource string) (string, string, string) {

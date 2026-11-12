@@ -30,11 +30,13 @@ import (
 	fakecoordinationv1 "k8s.io/client-go/kubernetes/typed/coordination/v1/fake"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	fakecorev1 "k8s.io/client-go/kubernetes/typed/core/v1/fake"
+	resourcev1beta1 "k8s.io/client-go/kubernetes/typed/resource/v1beta1"
 	storagev1 "k8s.io/client-go/kubernetes/typed/storage/v1"
 	fakestoragev1 "k8s.io/client-go/kubernetes/typed/storage/v1/fake"
 
 	kecoordinationv1 "github.com/kubeedge/kubeedge/edge/pkg/edged/kubeclientbridge/typed/coordination/v1"
 	kecorev1 "github.com/kubeedge/kubeedge/edge/pkg/edged/kubeclientbridge/typed/core/v1"
+	keresourcev1beta1 "github.com/kubeedge/kubeedge/edge/pkg/edged/kubeclientbridge/typed/resource/v1beta1"
 	kestoragev1 "github.com/kubeedge/kubeedge/edge/pkg/edged/kubeclientbridge/typed/storage/v1"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/client"
 )
@@ -62,4 +64,15 @@ func (c *Clientset) StorageV1() storagev1.StorageV1Interface {
 
 func (c *Clientset) CoordinationV1() coordinationv1.CoordinationV1Interface {
 	return &kecoordinationv1.CoordinationV1Bridge{FakeCoordinationV1: fakecoordinationv1.FakeCoordinationV1{Fake: &c.Fake}, MetaClient: c.MetaClient}
+}
+
+// ResourceV1beta1 retrieves the ResourceV1beta1Client (resource.k8s.io,
+// DRA). Without this explicit override, calling c.ResourceV1beta1() would
+// silently resolve to the method promoted from the embedded
+// fakekube.Clientset (see NewSimpleClientset above) - it would compile
+// and "work" but every call would hit an in-memory fake tracker with no
+// connection to the real cluster, not a compile error and not a runtime
+// panic. That is the actual gap here, not a missing method.
+func (c *Clientset) ResourceV1beta1() resourcev1beta1.ResourceV1beta1Interface {
+	return keresourcev1beta1.NewResourceV1beta1Bridge()
 }

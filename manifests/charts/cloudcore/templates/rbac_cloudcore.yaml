@@ -41,4 +41,12 @@ rules:
   - apiGroups: ["operations.kubeedge.io"]
     resources: ["nodeupgradejobs", "nodeupgradejobs/status", "imageprepulljobs", "imageprepulljobs/status", "configupdatejobs", "configupdatejobs/status"]
     verbs: ["get", "list", "watch", "update", "patch"]
-
+  # DRA (resource.k8s.io): cloudcore proxies edge-originated requests to the
+  # apiserver. Edge kubelet only reads ResourceClaims; the DRA driver manages
+  # ResourceSlices (create/update/delete, plus list/watch for its informer).
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims"]
+    verbs: ["get"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceslices"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]

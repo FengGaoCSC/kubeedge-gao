@@ -17,17 +17,22 @@ limitations under the License.
 package handlerfactory
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metainternalversionscheme "k8s.io/apimachinery/pkg/apis/meta/internalversion/scheme"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/validation"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apiserver/pkg/endpoints/handlers"
@@ -76,6 +81,105 @@ func (f *Factory) Delete() http.Handler {
 	h := handlers.DeleteResource(f.storage, true, f.scope, fakers.NewAlwaysAdmit())
 	f.handlers["delete"] = h
 	return h
+}
+
+func (f *Factory) DeleteCollection(reqInfo *request.RequestInfo) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			klog.Errorf("DeleteCollection: read request error: %v", err)
+			return
+		}
+
+		listReq := req.Clone(req.Context())
+		listReq.Method = http.MethodGet
+		listReq.Body = http.NoBody
+		listInfo := *reqInfo
+		listInfo.Verb = "list"
+		listReq = listReq.WithContext(request.WithRequestInfo(listReq.Context(), &listInfo))
+
+		listRec := httptest.NewRecorder()
+		f.List().ServeHTTP(listRec, listReq)
+		if listRec.Code != http.StatusOK {
+			klog.Errorf("DeleteCollection: list record error")
+			return
+		}
+
+		list_rec_body := listRec.Body.Bytes()
+		if listRec.Header().Get("Content-Encoding") == "gzip" {
+			zr, err := gzip.NewReader(bytes.NewReader(list_rec_body))
+			if err != nil {
+				klog.Errorf("DeleteCollection: gzip reader error: %v", err)
+				return
+			}
+			defer zr.Close()
+			if list_rec_body, err = io.ReadAll(zr); err != nil {
+				klog.Errorf("DeleteCollection: gunzip error: %v", err)
+				return
+			}
+		}
+		list := &unstructured.UnstructuredList{}
+		if err := list.UnmarshalJSON(list_rec_body); err != nil {
+			klog.Errorf("DeleteCollection: unmarshalJSON error: %v", err)
+			return
+		}
+
+		sel := fields.Everything()
+		if fs := req.URL.Query().Get("fieldSelector"); fs != "" {
+			if sel, err = fields.ParseSelector(fs); err != nil {
+				klog.Errorf("DeleteCollection: parse field selector error: %v", err)
+				return
+			}
+		}
+
+		var errs []error
+		for i := range list.Items {
+			item := &list.Items[i]
+			if !sel.Matches(fieldSetOf(item, sel)) {
+				continue
+			}
+
+			delPath := strings.TrimSuffix(req.URL.Path, "/") + "/" + item.GetName()
+			delReq := req.Clone(req.Context())
+			delReq.Method = http.MethodDelete
+			delReq.URL.Path = delPath
+			delReq.URL.RawQuery = ""
+			delReq.Body = io.NopCloser(bytes.NewReader(body))
+			delInfo := *reqInfo
+			delInfo.Verb = "delete"
+			delInfo.Name = item.GetName()
+			delInfo.Path = delPath
+			delReq = delReq.WithContext(request.WithRequestInfo(delReq.Context(), &delInfo))
+
+			rec := httptest.NewRecorder()
+			f.Delete().ServeHTTP(rec, delReq)
+			if rec.Code >= 300 && rec.Code != http.StatusNotFound {
+				errs = append(errs, fmt.Errorf("delete %s: status %d: %s",
+					item.GetName(), rec.Code, rec.Body.String()))
+			}
+		}
+
+		if len(errs) > 0 {
+			klog.Errorf("DeleteCollection: http request error: %v", errs)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(listRec.Body.Bytes())
+	})
+}
+
+// fieldSetOf builds a fields.Set with exactly the fields the selector asks about,
+// read from the object by dotted path (e.g. "spec.nodeName", "spec.driver").
+func fieldSetOf(obj *unstructured.Unstructured, sel fields.Selector) fields.Set {
+	set := fields.Set{}
+	for _, r := range sel.Requirements() {
+		if v, found, _ := unstructured.NestedString(obj.Object, strings.Split(r.Field, ".")...); found {
+			set[r.Field] = v
+		}
+	}
+	return set
 }
 
 func (f *Factory) Patch(reqInfo *request.RequestInfo) http.Handler {

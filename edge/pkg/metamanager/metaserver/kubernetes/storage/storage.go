@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -111,6 +113,7 @@ func (r *REST) Get(ctx context.Context, _ string, options *metav1.GetOptions) (r
 			klog.Errorf("[metaserver/reststorage] failed to get obj from cloud: %v", err)
 			return nil, err
 		}
+
 		var obj = new(unstructured.Unstructured)
 		err = json.Unmarshal(app.RespBody, obj)
 		if err != nil {
@@ -188,11 +191,14 @@ func (r *REST) List(ctx context.Context, options *metainternalversion.ListOption
 			klog.Errorf("[metaserver/reststorage] failed to list obj from cloud: %v", err)
 			return nil, err
 		}
+
 		var list = new(unstructured.UnstructuredList)
 		err = json.Unmarshal(app.RespBody, list)
 		if err != nil {
 			return nil, err
 		}
+		// reconcile the local cache with the authoritative cloud list
+		r.pruneStaleCache(ctx, app.Key, options, list)
 		// imitator.DefaultV2Client.InsertOrUpdateObj(context.TODO(), list)
 		klog.Infof("[metaserver/reststorage] successfully process list req (%v) through cloud", info.Path)
 		return list, nil
@@ -209,6 +215,74 @@ func (r *REST) List(ctx context.Context, options *metainternalversion.ListOption
 
 	decorateList(ctx, list)
 	return list, err
+}
+
+func (r *REST) pruneStaleCache(ctx context.Context, prefix string,
+	opts *metainternalversion.ListOptions, list *unstructured.UnstructuredList) {
+	klog.Infof("[metaserver/reststorage] REST pruneStaleCache, limit=%d continue=%q respContinue=%q label=%v field=%v",
+		opts.Limit, opts.Continue, list.GetContinue(), opts.LabelSelector, opts.FieldSelector)
+	// Only a complete, unfiltered list is authoritative for its key prefix.
+	if opts.Continue != "" || list.GetContinue() != "" {
+		return
+	}
+	match, ok := buildMatcher(opts)
+	if !ok {
+		klog.Infof("[metaserver/reststorage] REST pruneStaleCache, unsupported selector %v, skip", opts.FieldSelector)
+		return
+	}
+	listRV, err := strconv.ParseUint(list.GetResourceVersion(), 10, 64)
+	if err != nil {
+		return // can't order rows against the list, so don't prune
+	}
+	keep := make(map[string]struct{}, len(list.Items))
+	for i := range list.Items {
+		key, err := metaserver.KeyFuncObj(&list.Items[i])
+		if err != nil {
+			return // can't build keys the way the write path does, so don't prune
+		}
+		keep[key] = struct{}{}
+	}
+	p := strings.TrimSuffix(prefix, "/") + "/" // "resourceslices/" must not match "resourceslices-foo"
+	n, err := imitator.DefaultV2Client.PruneByPrefix(ctx, p, keep, listRV, match)
+	if err != nil {
+		klog.Errorf("[metaserver/reststorage] REST pruneStaleCache, failed to prune stale cache under %s: %v", p, err)
+		return
+	}
+	if n > 0 {
+		klog.Infof("[metaserver/reststorage] REST pruneStaleCache, pruned %d stale meta_v2 rows under %s", n, p)
+	}
+}
+
+var supported = map[string]bool{
+	"metadata.name": true, "metadata.namespace": true,
+	"spec.nodeName": true, "spec.driver": true,
+}
+
+func buildMatcher(opts *metainternalversion.ListOptions) (func(*unstructured.Unstructured) bool, bool) {
+	if opts.FieldSelector != nil {
+		for _, req := range opts.FieldSelector.Requirements() {
+			if !supported[req.Field] {
+				return nil, false // can't evaluate locally, so don't prune
+			}
+		}
+	}
+	return func(o *unstructured.Unstructured) bool {
+		if opts.LabelSelector != nil && !opts.LabelSelector.Empty() && !opts.LabelSelector.Matches(labels.Set(o.GetLabels())) {
+			return false
+		}
+		if opts.FieldSelector != nil && !opts.FieldSelector.Empty() {
+			nodeName, _, _ := unstructured.NestedString(o.Object, "spec", "nodeName")
+			driver, _, _ := unstructured.NestedString(o.Object, "spec", "driver")
+			fs := fields.Set{
+				"metadata.name": o.GetName(), "metadata.namespace": o.GetNamespace(),
+				"spec.nodeName": nodeName, "spec.driver": driver,
+			}
+			if !opts.FieldSelector.Matches(fs) {
+				return false
+			}
+		}
+		return true
+	}, true
 }
 
 func (r *REST) Watch(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {

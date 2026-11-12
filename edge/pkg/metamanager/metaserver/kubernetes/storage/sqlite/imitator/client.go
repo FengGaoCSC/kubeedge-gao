@@ -38,6 +38,7 @@ type Client interface {
 	List(ctx context.Context, key string) (Resp, error)
 	Get(ctx context.Context, key string) (Resp, error)
 	Watch(ctx context.Context, key string, ResourceVersion uint64) <-chan watch.Event
+	PruneByPrefix(ctx context.Context, prefix string, keep map[string]struct{}, maxRV uint64, match func(*unstructured.Unstructured) bool) (int, error)
 }
 
 type Resp struct {

@@ -3,6 +3,7 @@ package fake
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 
@@ -22,6 +23,7 @@ type Client struct {
 	ListF                         func(ctx context.Context, key string) (imitator.Resp, error)
 	GetF                          func(ctx context.Context, key string) (imitator.Resp, error)
 	WatchF                        func(ctx context.Context, key string, ResourceVersion uint64) <-chan watch.Event
+	PruneByPrefixF                func(ctx context.Context, prefix string, keep map[string]struct{}, maxRV uint64, match func(*unstructured.Unstructured) bool) (int, error)
 }
 
 // Inject fake
@@ -72,4 +74,8 @@ func (c Client) Get(ctx context.Context, key string) (imitator.Resp, error) {
 // Watch fake
 func (c Client) Watch(ctx context.Context, key string, ResourceVersion uint64) <-chan watch.Event {
 	return c.WatchF(ctx, key, ResourceVersion)
+}
+
+func (c Client) PruneByPrefix(ctx context.Context, prefix string, keep map[string]struct{}, maxRV uint64, match func(*unstructured.Unstructured) bool) (int, error) {
+	return c.PruneByPrefixF(ctx, prefix, keep, maxRV, match)
 }

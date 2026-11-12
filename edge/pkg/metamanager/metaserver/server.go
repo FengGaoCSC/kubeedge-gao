@@ -2,6 +2,7 @@ package metaserver
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -23,6 +24,8 @@ import (
 	"k8s.io/apiserver/pkg/authentication/request/anonymous"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	authnunion "k8s.io/apiserver/pkg/authentication/request/union"
+
+	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	authzunion "k8s.io/apiserver/pkg/authorization/union"
 	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
@@ -41,6 +44,7 @@ import (
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/client"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/auth"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/certificate"
+	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/common"
 	metaserverconfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/config"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/handlerfactory"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/serializer"
@@ -83,6 +87,47 @@ func (a *AlwaysAllowDiscoveryAuthorizer) Authorize(ctx context.Context, attrs au
 	return authorizer.DecisionNoOpinion, "", nil
 }
 
+type loopbackFirstAuthenticator struct {
+	next authenticator.Token
+}
+
+func (a loopbackFirstAuthenticator) AuthenticateToken(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+	if subtle.ConstantTimeCompare([]byte(token), []byte(common.LoopbackToken())) == 1 {
+		return &authenticator.Response{
+			User: &user.DefaultInfo{
+				Name:   common.LoopbackUser,
+				Groups: []string{"system:authenticated"},
+			},
+		}, true, nil
+	}
+	return a.next.AuthenticateToken(ctx, token)
+}
+
+type loopbackDRAAuthorizer struct{}
+
+func (loopbackDRAAuthorizer) Authorize(ctx context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
+	if !a.IsResourceRequest() || a.GetUser() == nil ||
+		a.GetUser().GetName() != common.LoopbackUser ||
+		a.GetAPIGroup() != "resource.k8s.io" {
+		return authorizer.DecisionNoOpinion, "", nil
+	}
+
+	switch a.GetResource() {
+	case "resourceclaims":
+		if a.GetVerb() == "get" {
+			return authorizer.DecisionAllow, "edgecore loopback DRA read", nil
+		}
+	case "resourceslices":
+		switch a.GetVerb() {
+		// deletecollection is what wipeResourceSlices uses; //list and delete
+		// are included so a list-then-delete fallback also works.
+		case "deletecollection": //, "list", "delete":
+			return authorizer.DecisionAllow, "edgecore loopback DRA ResourceSlice cleanup", nil
+		}
+	}
+	return authorizer.DecisionNoOpinion, "", nil
+}
+
 func buildAuth() *metaServerAuth {
 	newAuthorizer := rbac.New(
 		&client.RoleGetter{},
@@ -102,7 +147,7 @@ func buildAuth() *metaServerAuth {
 	tokenAuthenticator := auth.JWTTokenAuthenticator(nil,
 		metaserverconfig.Config.ServiceAccountIssuers, allPublicKeys, metaserverconfig.Config.APIAudiences,
 		auth.NewValidator(client.NewGetterFromClient(kubeclientbridge.NewSimpleClientset(client.New()))))
-	bearerTokenAuthenticator := bearertoken.New(tokenAuthenticator)
+	bearerTokenAuthenticator := bearertoken.New(loopbackFirstAuthenticator{next: tokenAuthenticator})
 
 	// Use union authenticator with anonymous fallback for discovery paths
 	// This follows Kubernetes API Server's standard approach for anonymous access
@@ -111,7 +156,7 @@ func buildAuth() *metaServerAuth {
 
 	// Use union authorizer with discovery paths allowed first, then RBAC
 	discoveryAuthorizer := &AlwaysAllowDiscoveryAuthorizer{}
-	unionAuthorizer := authzunion.New(discoveryAuthorizer, newAuthorizer)
+	unionAuthorizer := authzunion.New(discoveryAuthorizer, loopbackDRAAuthorizer{}, newAuthorizer)
 
 	return &metaServerAuth{newAuthenticator, unionAuthorizer}
 }
@@ -236,6 +281,8 @@ func (ls *MetaServer) BuildBasicHandler() http.Handler {
 				}
 			case reqInfo.Verb == "delete":
 				ls.Factory.Delete().ServeHTTP(w, req)
+			case reqInfo.Verb == "deletecollection":
+				ls.Factory.DeleteCollection(reqInfo).ServeHTTP(w, req)
 			case reqInfo.Verb == "update":
 				ls.Factory.Update(reqInfo).ServeHTTP(w, req)
 			case reqInfo.Verb == "patch":

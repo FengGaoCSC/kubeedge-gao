@@ -123,6 +123,25 @@ func UnstructuredAttr(obj runtime.Object) (labels.Set, fields.Set, error) {
 			}
 		}
 		return metadata.GetLabels(), setMap, nil
+	case "ResourceSlice":
+		metadata, err := meta.Accessor(obj)
+		if err != nil {
+			return nil, nil, err
+		}
+		setMap := make(fields.Set)
+		if metadata.GetName() != "" {
+			setMap["metadata.name"] = metadata.GetName()
+		}
+		unstrObj, ok := obj.(*unstructured.Unstructured)
+		if ok {
+			if v, found, err := unstructured.NestedString(unstrObj.Object, "spec", "nodeName"); found && err == nil {
+				setMap["spec.nodeName"] = v
+			}
+			if v, found, err := unstructured.NestedString(unstrObj.Object, "spec", "driver"); found && err == nil {
+				setMap["spec.driver"] = v
+			}
+		}
+		return metadata.GetLabels(), setMap, nil
 	default:
 		return storage.DefaultNamespaceScopedAttr(obj)
 	}
